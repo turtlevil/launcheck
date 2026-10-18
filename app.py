@@ -1230,3 +1230,273 @@ def reset_demo():
         return serialize_project(conn, pid)
 
 
+# --- v3: consent-based employee onboarding and individual integrations ---
+
+def current_employee(request:Request,conn):
+    employee_id=request.session.get('employee_id')
+    if not employee_id:
+        raise HTTPException(401,'Employee sign-in required')
+    row=conn.execute('SELECT id,name,email,role FROM employees WHERE id=?',(employee_id,)).fetchone()
+    if not row: raise HTTPException(401,'Employee session expired')
+    return row
+
+
+@app.get('/api/team/slack-directory')
+def owner_slack_directory(request:Request):
+    """Read owner-authorized Slack directory; never invite anyone automatically."""
+    if not request.session.get('owner'):raise HTTPException(403,'Owner only')
+    with db() as conn:
+        account=get_conn(conn,'slack')
+        if not account:raise HTTPException(409,'Connect Slack as the owner first.')
+        owner=public_workspace(conn)
+        existing={r['email'] for r in conn.execute('SELECT email FROM employees')}
+        try:members=connectors.fetch_slack_members(account['access_token'])
+        except Exception as exc:raise HTTPException(502,'Could not read Slack members: '+str(exc)[:160]) from exc
+        seen=set();directory=[]
+        for person in members:
+            email=person['email'].strip().lower()
+            if email in seen or email==owner['owner_email'].lower():continue
+            seen.add(email)
+            directory.append({**person,'email':email,'already_joined':email in existing})
+        return {'members':directory,'notice':'Choose recipients and generate private links. Nothing is emailed automatically.'}
+
+
+@app.post('/api/team/slack-links')
+def generate_slack_employee_links(payload:CreateSlackInviteLinks,request:Request):
+    """Issue private, time-limited registration links to *selected* Slack members.
+
+    Does not contact an email provider. Raw tokens are returned exactly once to the
+    signed-in owner and only SHA-256 hashes are stored in the database.
+    """
+    if not request.session.get('owner'):raise HTTPException(403,'Owner only')
+    with db() as conn:
+        owner=public_workspace(conn)
+        account=get_conn(conn,'slack')
+        if not account:raise HTTPException(409,'Connect Slack first.')
+        try:all_members=connectors.fetch_slack_members(account['access_token'])
+        except Exception as exc:raise HTTPException(502,'Could not verify Slack members: '+str(exc)[:160]) from exc
+        allowed={person['email'].strip().lower() for person in all_members}
+        emails=[p.email.strip().lower() for p in payload.recipients]
+        if len(emails)!=len(set(emails)):
+            raise HTTPException(422,'Duplicate invitation email detected.')
+        if any(email not in allowed or email==owner['owner_email'].lower() for email in emails):
+            raise HTTPException(422,'You may only invite members verified in this Slack workspace.')
+        if any(conn.execute('SELECT 1 FROM employees WHERE email=?',(email,)).fetchone() for email in emails):
+            raise HTTPException(409,'One or more selected people have already joined launcheck.')
+        results=[]
+        for person in payload.recipients:
+            email=person.email.strip().lower()
+            token=secrets.token_urlsafe(36)
+            digest=hashlib.sha256(token.encode()).hexdigest()
+            conn.execute('DELETE FROM employee_invites WHERE email=?',(email,))
+            conn.execute('INSERT INTO employee_invites VALUES (?,?,?,?,0)',
+                         (digest,email,person.role.strip(),int(time.time())+72*3600))
+            results.append({'email':email,'role':person.role.strip(), 'url_path':'/?join='+token})
+        return {'invites':results,'expires_hours':72,
+                'warning':'Copy and share privately. No emails have been sent. These links grant access without inbox verification.'}
+
+
+@app.post('/api/team/assignments/{scenario_id}/response')
+def employee_respond_to_assigned_scenario(scenario_id:str,payload:EmployeeScenarioResponse,request:Request):
+    with db() as conn:
+        person=current_employee(request,conn)
+        scenario=conn.execute('''SELECT s.id,s.role,s.status,s.question_type,s.options_json,p.is_demo FROM scenarios s
+            JOIN projects p ON p.id=s.project_id WHERE s.id=?''',(scenario_id,)).fetchone()
+        if not scenario or scenario['is_demo'] or scenario['status']!='published' or not matching_team_role(person['role'],scenario['role']):
+            raise HTTPException(403,'This question is not published for your department.')
+        if scenario['question_type']=='text':
+            if not payload.rationale.strip(): raise HTTPException(422,'Write an answer before submitting.')
+            answer='text'
+        else:
+            choices={x['action'] for x in json.loads(scenario['options_json'])}
+            if payload.action not in choices: raise HTTPException(422,'Action not offered in this question.')
+            answer=payload.action
+        previous=conn.execute('SELECT 1 FROM responses WHERE scenario_id=?',(scenario_id,)).fetchone()
+        if previous:raise HTTPException(409,'This scenario has already been answered. Ask the owner to reset the test.')
+        conn.execute('''INSERT INTO responses (id,scenario_id,participant,action,rationale,created_at)
+            VALUES (?,?,?,?,?,?)''',(uuid.uuid4().hex[:12],scenario_id,person['name'],answer,payload.rationale,now()))
+        return employee_status(conn,person['id'])
+
+
+@app.post('/api/team/invite')
+def invite_employee(payload:TeamInviteRequest,request:Request):
+    if not request.session.get('owner'): raise HTTPException(403,'Owner only')
+    email=payload.email.strip().lower()
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):
+        raise HTTPException(422,'Enter a valid employee email address')
+    with db() as conn:
+        if conn.execute('SELECT 1 FROM employees WHERE email=?',(email,)).fetchone():
+            raise HTTPException(409,'That employee already joined')
+        token=secrets.token_urlsafe(36); digest=hashlib.sha256(token.encode()).hexdigest()
+        conn.execute('DELETE FROM employee_invites WHERE email=?',(email,))
+        conn.execute('''INSERT INTO employee_invites VALUES (?,?,?,?,0)''',
+                     (digest,email,payload.role.strip(),int(time.time())+72*3600))
+    return {'email':email,'url_path':'/?join='+token,'expires_hours':72,
+            'warning':'Share the invitation privately. This prototype does not verify inbox ownership.'}
+
+
+@app.get('/api/team/invite/{token}')
+def employee_invitation(token:str):
+    digest=hashlib.sha256(token.encode()).hexdigest()
+    with db() as conn:
+        row=conn.execute('SELECT email,role,expires_at,redeemed_at FROM employee_invites WHERE token_hash=?',
+                         (digest,)).fetchone()
+        if not row or row['redeemed_at'] or row['expires_at']<time.time():
+            raise HTTPException(404,'Invitation is invalid or expired')
+        ws=public_workspace(conn)
+        return {'company':ws['company'] if ws else 'Company','email':row['email'],'role':row['role']}
+
+
+@app.post('/api/team/accept')
+def employee_accept(payload:TeamAccept,request:Request):
+    digest=hashlib.sha256(payload.token.encode()).hexdigest()
+    with db() as conn:
+        row=conn.execute('SELECT * FROM employee_invites WHERE token_hash=?',(digest,)).fetchone()
+        if not row or row['redeemed_at'] or row['expires_at']<time.time():
+            raise HTTPException(404,'Invitation expired or already used')
+        if conn.execute('SELECT 1 FROM employees WHERE email=?',(row['email'],)).fetchone():
+            raise HTTPException(409,'Employee already joined')
+        eid=uuid.uuid4().hex[:16]
+        conn.execute('INSERT INTO employees VALUES (?,?,?,?,?,?)',
+                     (eid,payload.name.strip(),row['email'],row['role'],password_hash(payload.password),now()))
+        conn.execute('UPDATE employee_invites SET redeemed_at=? WHERE token_hash=?',
+                     (int(time.time()),digest))
+        request.session.clear();request.session['employee_id']=eid
+        return employee_status(conn,eid)
+
+
+@app.post('/api/team/login')
+def employee_login(payload:EmployeeLogin,request:Request):
+    with db() as conn:
+        row=conn.execute('SELECT id,password_hash FROM employees WHERE email=?',(payload.email.strip().lower(),)).fetchone()
+        if not row or not password_matches(payload.password,row['password_hash']):
+            raise HTTPException(401,'Incorrect employee email or password')
+        request.session.clear();request.session['employee_id']=row['id']
+        return employee_status(conn,row['id'])
+
+
+@app.post('/api/team/logout')
+def employee_logout(request:Request):
+    request.session.clear()
+    return {'ok':True}
+
+
+@app.get('/api/team/me')
+def team_me(request:Request):
+    with db() as conn:
+        employee=current_employee(request,conn)
+        return employee_status(conn,employee['id'])
+
+
+@app.get('/api/team/members')
+def team_members(request:Request):
+    if not request.session.get('owner'):raise HTTPException(403,'Owner only')
+    with db() as conn:
+        return [dict(r) for r in conn.execute('''SELECT e.id,e.name,e.email,e.role,
+            (SELECT COUNT(*) FROM employee_connections ec WHERE ec.employee_id=e.id) AS connected_count,
+            (SELECT COUNT(*) FROM employee_project_consent pc WHERE pc.employee_id=e.id) AS shared_count
+            FROM employees e ORDER BY e.created_at DESC''')]
+
+
+@app.post('/api/team/projects/{project_id}/consent')
+def employee_share(project_id:str,payload:ShareProject,request:Request):
+    with db() as conn:
+        employee=current_employee(request,conn)
+        project=conn.execute('SELECT id,is_demo FROM projects WHERE id=?',(project_id,)).fetchone()
+        if not project or project['is_demo']:
+            raise HTTPException(404,'Unknown project')
+        if payload.shared:
+            conn.execute('''INSERT OR IGNORE INTO employee_project_consent VALUES (?,?,?)''',
+                         (employee['id'],project_id,now()))
+        else:
+            had_imports=conn.execute('SELECT 1 FROM sources WHERE project_id=? AND employee_id=?',
+                                     (project_id,employee['id'])).fetchone()
+            conn.execute('DELETE FROM employee_project_consent WHERE employee_id=? AND project_id=?',
+                         (employee['id'],project_id))
+            conn.execute('DELETE FROM sources WHERE project_id=? AND employee_id=?',
+                         (project_id,employee['id']))
+            # Generated prompts could include snippets from revoked sources. Invalidate them,
+            # including invitations/responses that refer to those scenarios.
+            if had_imports:
+                conn.execute('DELETE FROM scenarios WHERE project_id=?',(project_id,))
+        return employee_status(conn,employee['id'])
+
+
+@app.get('/api/team/connectors/{provider}/start')
+def employee_connect_start(provider:str,request:Request):
+    if provider not in ('slack','gmail'):raise HTTPException(404,'No connector')
+    with db() as conn:
+        employee=current_employee(request,conn)
+        if not connectors.configured(provider):
+            raise HTTPException(409,'Provider credentials/encryption key must be configured in .env')
+        state=secrets.token_urlsafe(28)
+        request.session['employee_oauth_'+provider]=state
+        request.session['employee_oauth_user_'+provider]=employee['id']
+    return RedirectResponse(connectors.employee_authorization_url(provider,state))
+
+
+@app.get('/api/team/connectors/{provider}/callback')
+def employee_connect_callback(provider:str,request:Request,code:str='',state:str='',error:str=''):
+    if provider not in ('slack','gmail'):raise HTTPException(404,'No connector')
+    with db() as conn:
+        employee=current_employee(request,conn)
+        expected_state=request.session.pop('employee_oauth_'+provider,None)
+        expected_user=request.session.pop('employee_oauth_user_'+provider,None)
+        if not expected_state or not state or not hmac.compare_digest(expected_state,state) or expected_user!=employee['id']:
+            raise HTTPException(400,'Invalid OAuth state')
+        if error or not code:raise HTTPException(400,'OAuth canceled: '+error[:90])
+        try:
+            account=connectors.employee_exchange(provider,code)
+            if provider=='gmail' and account['label'].strip().lower()!=employee['email']:
+                raise HTTPException(400,'Google email does not match invited employee email: '+employee['email'])
+            store_employee_connection(conn,employee['id'],provider,account)
+        except HTTPException:raise
+        except Exception as exc:raise HTTPException(502,str(exc)[:180]) from exc
+    return RedirectResponse('/?team=1&connected='+provider,status_code=303)
+
+
+@app.get('/api/team/connectors/slack/channels')
+def employee_slack_channels(request:Request):
+    with db() as conn:
+        employee=current_employee(request,conn)
+        account=get_employee_connection(conn,employee['id'],'slack')
+        if not account:raise HTTPException(409,'Connect Slack first')
+        try:options=connectors.fetch_slack_channels(account['access_token'])
+        except Exception as exc:raise HTTPException(502,str(exc)[:150]) from exc
+        chosen={r['channel_id'] for r in conn.execute('SELECT channel_id FROM employee_channels WHERE employee_id=?',(employee['id'],))}
+        return [{**item,'selected':item['id'] in chosen} for item in options]
+
+
+@app.post('/api/team/connectors/slack/channels')
+def employee_select_channels(payload:ChannelSelection,request:Request):
+    with db() as conn:
+        employee=current_employee(request,conn)
+        account=get_employee_connection(conn,employee['id'],'slack')
+        if not account:raise HTTPException(409,'Connect Slack first')
+        try:options=connectors.fetch_slack_channels(account['access_token'])
+        except Exception as exc:raise HTTPException(502,str(exc)[:150]) from exc
+        allowed={c['id']:c['name'] for c in options}
+        if any(cid not in allowed for cid in payload.ids):
+            raise HTTPException(422,'Only channels accessible to your Slack account can be selected')
+        conn.execute('DELETE FROM employee_channels WHERE employee_id=?',(employee['id'],))
+        for cid in dict.fromkeys(payload.ids):
+            conn.execute('INSERT INTO employee_channels VALUES (?,?,?)',(employee['id'],cid,allowed[cid]))
+        return employee_status(conn,employee['id'])
+
+
+@app.post('/api/team/connectors/{provider}/disconnect')
+def employee_disconnect(provider:str,request:Request):
+    if provider not in ('slack','gmail'):raise HTTPException(404,'No connector')
+    with db() as conn:
+        employee=current_employee(request,conn)
+        affected=[r['project_id'] for r in conn.execute(
+            'SELECT DISTINCT project_id FROM sources WHERE employee_id=? AND provider=?',
+            (employee['id'],provider))]
+        conn.execute('DELETE FROM employee_connections WHERE employee_id=? AND provider=?',
+                     (employee['id'],provider))
+        conn.execute('DELETE FROM sources WHERE employee_id=? AND provider=?',
+                     (employee['id'],provider))
+        for project_id in affected:
+            conn.execute('DELETE FROM scenarios WHERE project_id=?',(project_id,))
+        if provider=='slack':conn.execute('DELETE FROM employee_channels WHERE employee_id=?',(employee['id'],))
+        return employee_status(conn,employee['id'])
