@@ -414,3 +414,183 @@ Respond with JSON only, as an object with key \"scenarios\" and exactly four obj
     return result
 
 
+def password_hash(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 250_000)
+    return salt + ':' + digest.hex()
+
+
+def password_matches(password, stored):
+    try:
+        salt, digest = stored.split(':',1)
+        return hmac.compare_digest(password_hash(password,salt),stored)
+    except Exception:
+        return False
+
+
+def public_workspace(conn):
+    row=conn.execute('''SELECT company,owner_name,owner_email,slack_hint,gmail_hint,wanted_json FROM workspace WHERE id=1''').fetchone()
+    if not row: return None
+    result=dict(row); result['wanted']=json.loads(result.pop('wanted_json'))
+    return result
+
+
+def safe_connection_status(conn):
+    records={r['provider']:r['label'] for r in conn.execute('SELECT provider,label FROM connections')}
+    return {p:{'connected':p in records,'label':records.get(p,''),'available':connectors.configured(p)} for p in ('slack','gmail')}
+
+
+def get_conn(conn, provider):
+    record=conn.execute('SELECT encrypted_token FROM connections WHERE provider=?',(provider,)).fetchone()
+    if not record: return None
+    try:
+        data=json.loads(connectors.cipher().decrypt(record['encrypted_token'].encode()))
+    except Exception as exc:
+        raise HTTPException(409, 'Cannot decrypt connection. Check CONNECTOR_ENCRYPTION_KEY, or disconnect and reconnect.') from exc
+    if provider=='gmail' and data.get('expires_at',0)<time.time():
+        try:
+            data=connectors.refresh_google(data)
+        except Exception as exc:
+            raise HTTPException(409, str(exc)) from exc
+        save_conn(conn,provider,data)
+    return data
+
+
+def save_conn(conn,provider,data):
+    encrypted=connectors.cipher().encrypt(json.dumps(data).encode()).decode()
+    conn.execute('''INSERT INTO connections (provider,label,encrypted_token,created_at)
+        VALUES (?,?,?,?) ON CONFLICT(provider) DO UPDATE SET label=excluded.label,
+        encrypted_token=excluded.encrypted_token,created_at=excluded.created_at''',
+        (provider,data['label'],encrypted,now()))
+
+
+def matching_team_role(employee_role, scenario_role):
+    def normalized(role):
+        value=role.strip().casefold()
+        if value in ('customer support','customer service','support'): return 'support'
+        if value in ('product manager','leadership','ceo','product'): return 'product'
+        return value
+    return normalized(employee_role)==normalized(scenario_role)
+
+
+def employee_assignments(conn, employee_id, employee_role):
+    # Only returns the named employee's team questions; never project evidence or other responses.
+    rows=conn.execute('''SELECT s.id,s.project_id,s.role,s.title,s.situation,s.question,
+        s.options_json,s.question_type,p.name AS project_name,p.decision AS project_decision,
+        r.id AS response_id,r.action AS response_action
+        FROM scenarios s JOIN projects p ON p.id=s.project_id
+        LEFT JOIN responses r ON r.scenario_id=s.id
+        WHERE p.is_demo=0 AND s.status='published' ORDER BY p.created_at DESC,s.rowid DESC''').fetchall()
+    result=[]
+    for row in rows:
+        if matching_team_role(employee_role,row['role']):
+            entry=dict(row)
+            entry['options']=json.loads(entry.pop('options_json'))
+            result.append(entry)
+    return result
+
+
+def employee_status(conn, employee_id):
+    record=conn.execute('SELECT id,name,email,role FROM employees WHERE id=?',(employee_id,)).fetchone()
+    if not record: raise HTTPException(401,'Employee session expired')
+    rows=conn.execute('SELECT provider,label FROM employee_connections WHERE employee_id=?',(employee_id,))
+    connections={r['provider']:r['label'] for r in rows}
+    projects=[dict(r) for r in conn.execute('''SELECT p.id,p.name,p.decision,
+        CASE WHEN c.employee_id IS NULL THEN 0 ELSE 1 END AS shared
+        FROM projects p LEFT JOIN employee_project_consent c ON c.project_id=p.id AND c.employee_id=?
+        WHERE p.is_demo=0 ORDER BY p.created_at DESC''',(employee_id,))]
+    channels=[dict(r) for r in conn.execute('SELECT channel_id,channel_name FROM employee_channels WHERE employee_id=?',(employee_id,))]
+    return {'employee':dict(record),'projects':projects,'channels':channels,
+            'assignments':employee_assignments(conn,employee_id,record['role']),
+            'connectors':{p:{'connected':p in connections,'label':connections.get(p,''),
+                             'available':connectors.configured(p)} for p in ('slack','gmail')}}
+
+
+def get_employee_connection(conn, employee_id, provider):
+    rec=conn.execute('''SELECT encrypted_token FROM employee_connections
+        WHERE employee_id=? AND provider=?''',(employee_id,provider)).fetchone()
+    if not rec:return None
+    try:
+        data=json.loads(connectors.cipher().decrypt(rec['encrypted_token'].encode()))
+    except Exception as exc:
+        raise HTTPException(409,'Could not decrypt account token; reconnect using the same encryption key.') from exc
+    if provider=='gmail' and data.get('expires_at',0)<time.time():
+        data=connectors.refresh_google(data)
+        store_employee_connection(conn,employee_id,provider,data)
+    return data
+
+
+def store_employee_connection(conn, employee_id, provider, data):
+    encrypted=connectors.cipher().encrypt(json.dumps(data).encode()).decode()
+    conn.execute('''INSERT INTO employee_connections
+        (employee_id,provider,label,encrypted_token,created_at) VALUES (?,?,?,?,?)
+        ON CONFLICT(employee_id,provider) DO UPDATE SET
+        label=excluded.label,encrypted_token=excluded.encrypted_token,created_at=excluded.created_at''',
+        (employee_id,provider,data['label'],encrypted,now()))
+
+
+def sync_employee_sources(conn, project_id, terms):
+    results=[];errors=[];checked=[]
+    participants=conn.execute('''SELECT e.id,e.name FROM employees e JOIN employee_project_consent c
+      ON c.employee_id=e.id WHERE c.project_id=? ORDER BY e.name''',(project_id,)).fetchall()
+    for participant in participants:
+        employee_id=participant['id']
+        for provider in ('gmail','slack'):
+            if not conn.execute('SELECT 1 FROM employee_connections WHERE employee_id=? AND provider=?',
+                                (employee_id,provider)).fetchone():continue
+            checked.append({'employee':participant['name'],'provider':provider})
+            try:
+                token=get_employee_connection(conn, employee_id, provider)['access_token']
+                if provider=='slack':
+                    channels=[{'id':r['channel_id'],'name':r['channel_name']} for r in conn.execute(
+                        'SELECT channel_id,channel_name FROM employee_channels WHERE employee_id=?',(employee_id,))]
+                    if not channels:
+                        errors.append(participant['name']+': select Slack channels before syncing.')
+                        continue
+                    records=connectors.fetch_slack_messages(token,channels,terms)
+                else:
+                    records=connectors.fetch_gmail_messages(token,terms)
+                # Only replace this employee's previously imported records for this provider.
+                conn.execute('''DELETE FROM sources WHERE project_id=? AND provider=? AND employee_id=?''',
+                             (project_id,provider,employee_id))
+                for entry in records:
+                    name=participant['name']+' · '+entry['filename']
+                    # Mark origin unambiguously; owner sees snippets only after employee opts in.
+                    source_id=insert_source(conn,project_id,name,entry['kind'],entry['content'],provider,entry['external_id'])
+                    conn.execute('UPDATE sources SET employee_id=? WHERE id=?',(employee_id,source_id))
+                    results.append({'provider':provider,'employee':participant['name'],'filename':name})
+            except Exception as exc:
+                errors.append(participant['name']+' / '+provider+': '+str(exc)[:180])
+    return {'imported':results,'errors':errors,'checked':checked}
+
+
+def sync_context(conn, project_id):
+    project=serialize_project(conn,project_id)
+    terms=connectors.decision_terms(project['decision'])
+    results=[]; errors=[]; checked=[]
+    for provider in ('slack','gmail'):
+        conn_record=conn.execute('SELECT provider FROM connections WHERE provider=?',(provider,)).fetchone()
+        if not conn_record: continue
+        checked.append(provider)
+        try:
+            account=get_conn(conn,provider)
+            if provider=='slack':
+                channels=[{'id':r['channel_id'],'name':r['channel_name']} for r in conn.execute('SELECT * FROM selected_channels ORDER BY channel_name')]
+                if not channels:
+                    errors.append('Slack: select at least one joined channel in Integrations first.')
+                    continue
+                data=connectors.fetch_slack_messages(account['access_token'],channels,terms)
+            else:
+                data=connectors.fetch_gmail_messages(account['access_token'],terms)
+            # Replace the previous successfully fetched snapshot, including items no longer relevant.
+            conn.execute("DELETE FROM sources WHERE project_id=? AND provider=? AND employee_id=''", (project_id,provider))
+            for entry in data:
+                insert_source(conn,project_id,entry['filename'],entry['kind'],entry['content'],provider,entry['external_id'])
+                results.append({'provider':provider,'filename':entry['filename']})
+        except Exception as exc:
+            errors.append(provider.title()+': '+str(exc)[:220])
+    staff=sync_employee_sources(conn,project_id,terms)
+    return {'imported':results+staff['imported'],'errors':errors+staff['errors'],
+            'checked':checked+staff['checked']}
+
+
