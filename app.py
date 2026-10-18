@@ -177,3 +177,158 @@ def insert_scenario(conn, project_id: str, scenario: dict):
     return sid
 
 
+def seed_demo(conn):
+    """Seed synthetic ADP-relevant data; all names, facts, and responses are fictional."""
+    pid = insert_project(conn, 'Apollo Payroll Go-Live',
+        "We're ready to launch Apollo's new payroll experience on Friday. Run a cross-team readiness check.", True)
+    source_data = [
+        ('client-email.eml', 'Email', '''From: apollo-lead@example.test\nTo: implementation@example.test\nSubject: Payroll launch sign-off\n\nWe're TARGETING Friday, not approving it yet. Before a production launch we need both the final tax mapping validation to pass and written client sign-off. Until then, please do not announce general availability. An invite-only pilot is being considered but has not been approved.'''),
+        ('engineering-slack.txt', 'Slack', '''#apollo-implementation — Thursday, 10:14 AM\nPriya (Engineering): Final tax mapping failed our sample validation last night. Retest is scheduled for tomorrow morning. There's NO production approval yet. Please treat launch as blocked until validation passes and client sign-off arrives.\nNoah (Engineering): The integration build is deployed to staging only; production is still gated.'''),
+        ('marketing-launch-plan.md', 'Document', '''# Apollo launch campaign — DRAFT\nPlanned announcement: "Apollo Payroll is live for every customer this Friday."\nCampaign is PREPARED, not authorized to send. Marketing should hold general-availability communications pending launch approval. Previous meeting explored an invite-only pilot, not a full launch.'''),
+        ('support-runbook.md', 'Document', '''# Customer support readiness\nIf any customer reports missing payroll data, open a severity-1 incident and escalate to implementation immediately. Do not advise repeated retries or imply data loss is normal. Support cannot promise launch dates without written approval from both the client and implementation lead.'''),
+        ('project-checklist.csv', 'CSV', '''Task,Owner,Status\nTax mapping final validation,Engineering,FAILED — retest pending\nWritten sign-off,Client,NOT RECEIVED\nGA launch email,Marketing,DRAFT ONLY\nSupport escalation playbook,Customer Support,COMPLETE'''),
+    ]
+    ids = {}
+    for filename, kind, content in source_data:
+        ids[filename] = insert_source(conn, pid, filename, kind, content)
+    shared = [ids['client-email.eml'], ids['engineering-slack.txt'], ids['project-checklist.csv']]
+    scenarios = [
+        dict(role='Engineering', title='Technical go-live decision',
+             situation='Friday morning: final tax mapping validation is still failing, and the client has not provided written sign-off.',
+             question='What release decision will Engineering communicate?',
+             options=[{'label':'Block production release until validation and sign-off', 'action':'hold'},
+                      {'label':'Enable the invite-only pilot despite pending approval', 'action':'pilot'},
+                      {'label':'Turn on general availability as planned', 'action':'full'}],
+             source_ids=shared, reference_action='hold'),
+        dict(role='Marketing', title='Customer announcement decision',
+             situation='The launch campaign is drafted for Friday. Engineering has not confirmed validation, and written client approval is still missing.',
+             question='What should Marketing tell customers?',
+             options=[{'label':'Delay launch announcement pending approval', 'action':'hold'},
+                      {'label':'Announce a restricted pilot as if approved', 'action':'pilot'},
+                      {'label':'Send the full general-availability announcement', 'action':'full'}],
+             source_ids=[ids['client-email.eml'],ids['marketing-launch-plan.md']], reference_action='hold'),
+        dict(role='Customer Success', title='Client commitment decision',
+             situation='Apollo asks whether all employees can begin using the payroll platform on Friday.',
+             question='What commitment do you give the client?',
+             options=[{'label':'Explain that go-live awaits validation and written approval', 'action':'hold'},
+                      {'label':'Confirm a pilot for a subset of users', 'action':'pilot'},
+                      {'label':'Confirm Friday general availability', 'action':'full'}],
+             source_ids=[ids['client-email.eml'],ids['project-checklist.csv']], reference_action='hold'),
+        dict(role='Support', title='Support readiness decision',
+             situation='An internal team asks Support whether to activate the launch-day staffing and customer support playbook.',
+             question='Which launch status do you prepare to support?',
+             options=[{'label':'Stand by for approval; keep launch-day messaging on hold', 'action':'hold'},
+                      {'label':'Prepare for an approved restricted pilot', 'action':'pilot'},
+                      {'label':'Activate general-availability support and messaging', 'action':'full'}],
+             source_ids=[ids['support-runbook.md'],ids['client-email.eml']], reference_action='hold'),
+    ]
+    for s in scenarios:
+        insert_scenario(conn, pid, s)
+    return pid
+
+
+def serialize_project(conn, project_id: str):
+    p = conn.execute('SELECT * FROM projects WHERE id = ?', (project_id,)).fetchone()
+    if not p:
+        raise HTTPException(404, 'Project not found')
+    sources = [dict(r) for r in conn.execute('SELECT * FROM sources WHERE project_id = ? ORDER BY created_at, rowid', (project_id,))]
+    scenario_rows = conn.execute('SELECT * FROM scenarios WHERE project_id = ? ORDER BY rowid', (project_id,)).fetchall()
+    response_rows = conn.execute('''SELECT r.* FROM responses r JOIN scenarios s ON s.id = r.scenario_id
+                                  WHERE s.project_id = ?''', (project_id,)).fetchall()
+    response_by_scenario = {r['scenario_id']: dict(r) for r in response_rows}
+    scenarios = []
+    for s in scenario_rows:
+        d = dict(s)
+        d['options'] = json.loads(d.pop('options_json'))
+        d['source_ids'] = json.loads(d.pop('source_ids_json'))
+        d['response'] = response_by_scenario.get(d['id'])
+        scenarios.append(d)
+    report = make_report([s for s in scenarios if s.get('status') == 'published'], sources)
+    return {**dict(p), 'sources': sources, 'scenarios': scenarios, 'report': report}
+
+
+def make_report(scenarios: list[dict], sources: list[dict]):
+    replied = [s for s in scenarios if s.get('response')]
+    completed = len(replied)
+    if not completed:
+        status = 'awaiting'
+    elif completed < len(scenarios):
+        status = 'in_progress'
+    else:
+        status = 'completed'
+    # Never compare unrelated questions or free-text responses as release decisions.
+    conflicts = []
+    groups = {a: [] for a in ('hold','pilot','full')}
+    cohorts = {}
+    for q in replied:
+        if q.get('question_type') == 'multiple_choice' and q['response']['action'] in ACTIONS:
+            cohorts.setdefault(q.get('cohort', 'legacy'), []).append(q)
+    for cohort, questions in cohorts.items():
+        groups = {a: sorted({q['role'] for q in questions if q['response']['action'] == a})
+                  for a in ('hold', 'pilot', 'full')}
+        chosen = [a for a in groups if groups[a]]
+        for i, a in enumerate(chosen):
+            for b in chosen[i+1:]:
+                severity = 'high' if {a, b} == {'hold', 'full'} else 'medium'
+                conflicts.append({
+                    'id': cohort + ':' + a + '-' + b, 'severity': severity,
+                    'title': f"{ACTION_LABELS[a]} vs {ACTION_LABELS[b]}",
+                    'description': f"{', '.join(groups[a])} selected '{ACTION_LABELS[a]}', while {', '.join(groups[b])} selected '{ACTION_LABELS[b]}' for the same decision scenario.",
+                    'roles': groups[a] + groups[b],
+                    'next_action': 'Confirm the authorized release scope and communicate it to all affected teams.'
+                })
+    unsupported = []
+    for s in replied:
+        if s.get('question_type') == 'text':
+            continue
+        reference = s.get('reference_action', 'unknown')
+        if reference in ACTIONS and s['response']['action'] != reference:
+            unsupported.append({
+                'role': s['role'], 'action': s['response']['action'],
+                'reference_action': reference,
+                'message': f"{s['role']}'s response differs from the evidence-based working assumption: {ACTION_LABELS[reference].lower()}.",
+                'source_ids': s['source_ids'], 'scenario_id': s['id']
+            })
+    if conflicts:
+        headline = 'Cross-team conflict detected'
+        stance = 'attention'
+    elif unsupported:
+        headline = 'Responses need evidence review'
+        stance = 'attention'
+    elif completed == len(scenarios) and scenarios:
+        if all(s.get('question_type')=='text' for s in scenarios):
+            headline = 'All written responses received — ready for CEO review'
+            stance = 'completed'
+        else:
+            headline = 'No conflicts detected in comparable release actions'
+            stance = 'aligned'
+    elif completed:
+        headline = 'Alignment check in progress'
+        stance = 'in_progress'
+    else:
+        headline = 'Ready to stress-test this decision'
+        stance = 'awaiting'
+    return {
+        'status':status, 'stance':stance, 'headline':headline,
+        'written_answers':[{'role':q['role'],'question':q['question'],'participant':q['response']['participant'], 'answer':q['response']['rationale']} for q in replied if q.get('question_type')=='text'],
+        'responses_count':completed, 'total_roles':len(scenarios),
+        'conflicts':conflicts, 'unsupported':unsupported, 'groups':groups,
+        'actions':ACTION_LABELS,
+        'suggested_message': make_alignment_message(conflicts, unsupported, completed, len(scenarios)),
+        'caveat':'This check reveals differences in submitted scenarios, not verified future behavior. Evidence-based assumptions require human confirmation.'
+    }
+
+
+def make_alignment_message(conflicts, unsupported, completed, total):
+    opening = f"Launch readiness check: {completed}/{total} teams have responded."
+    if not conflicts and not unsupported:
+        return opening + " No conflicting responses identified so far. Please verify final written approval and remaining launch prerequisites before proceeding."
+    bits = [opening]
+    if conflicts:
+        bits.append('Teams selected incompatible launch actions: ' + '; '.join(c['title'] for c in conflicts) + '.')
+    if unsupported:
+        bits.append('Responses requiring evidence review: ' + ', '.join(u['role'] for u in unsupported) + '.')
+    bits.append('Please confirm the authorized release scope, required validation, and client sign-off in writing, then share the decision with all teams.')
+    return '\n\n'.join(bits)
+
+
