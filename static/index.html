@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#121a30" />
+  <title>launcheck · Align before you launch</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">L<span>✓</span></div><div><strong>launcheck</strong></div></div>
+      <div class="sidebar-section-label" id="companyLabel">WORKSPACE</div>
+      <nav class="sidebar-nav" id="primaryNav"></nav>
+      <div class="sidebar-section-label projects-label">PROJECTS</div>
+      <div id="projectsNav" class="projects-nav"></div>
+      <button class="sidebar-create" data-action="open-create"><span class="round-plus">+</span> New project</button>
+      <div class="sidebar-bottom">
+        <div class="mini-gradient"><span class="sparkle">✦</span><div><strong>Better decisions,<br/>before the deadline.</strong><small>Less guesswork. More alignment.</small></div></div>
+        <div class="sidebar-foot"><span class="small-dot"></span> Built for Hack Like W@CC 2026 <span class="version">v0.3</span></div>
+      </div>
+    </aside>
+    <div class="app-workspace">
+      <header class="topbar">
+        <div class="breadcrumb"><span class="breadcrumb-muted">Workspace</span><span class="breadcrumb-sep">/</span><span id="projectBreadcrumb">Loading project…</span></div>
+        <div class="top-actions"><span id="modeBadge" class="mode-badge">Loading…</span><button class="btn btn-outline btn-small" data-action="open-create">+ New check</button><div class="avatar" id="ownerAvatar" aria-label="Company owner">LC</div></div>
+      </header>
+      <main class="content" id="appContent"><div class="loading-state"><div class="spinner"></div> Loading launcheck…</div></main>
+    </div>
+  </div>
+  <div id="modalRoot"></div>
+  <div id="toastRoot" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
